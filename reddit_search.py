@@ -1,83 +1,89 @@
 #! /usr/bin/env python3
+# code for 'RunClassifiedsSearch' Lambda function
 import praw
 import pandas as pd
 import datetime as dt
 import os
+import sys
+import boto3
+from io import StringIO
+    
+AWS_S3_BUCKET = os.getenv('AWS_S3_BUCKET')
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+PRAW_CLIENT_ID = os.getenv('PRAW_CLIENT_ID')
+PRAW_CLIENT_SECRET = os.getenv('PRAW_CLIENT_SECRET')
+PRAW_USER_AGENT = os.getenv('PRAW_USER_AGENT')
 
-# convert date from UNIX timestamp to readable string
 def get_date(created):
+    """
+    Converts a date from the UNIX timestamp to a readable string.
+    """
     return dt.datetime.fromtimestamp(created)
 
-# parse queries.txt
-def parse_input():
-    data = {}
-    with open('./queries.txt', 'r') as f:
-        recent_key = ''
-        for _,line in enumerate(f):
-            if ('===' in line.strip()):
-                data[line[3:-1]] = []
-                recent_key = line[3:-1]
-            else:
-                data[recent_key].append(line.strip())
-                
-    return data
+# TODO: complete this function
+def validation_checks(data):
+    return True
 
-# returns the difference between old reddit post ids and new ones
-def get_new_post_ids(old_ids, new_ids):
-    
-    # checking membership of a set is O(1) whereas checking membership of a list is O(n)
-    s = set(old_ids)
-    diff = [x for x in new_ids if x not in s]  # list of any new posts
-    
-    return diff
-           
-           
-# setup     
-input_data = parse_input()
-subreddit_names = list(input_data.keys())
-
-reddit = praw.Reddit(client_id='7aPZyvmcVWgYZpF3Cz9_MQ', client_secret='eJeNi4cCqIVROWQsBeB8e-t-BFGl9Q', user_agent='classifieds_scraper')
-posts = {'id':[], 'title':[], 'body':[], 'created':[], 'query': [], 'url':[]}
-
-# collect data
-for sr in subreddit_names:
-    subreddit = reddit.subreddit(sr)
-    for q in input_data[sr]:
-        for post in subreddit.search(query=q, sort='new', time_filter='month', limit=20):
-            posts['id'].append(post.id)
-            posts['title'].append(post.title)
-            posts['body'].append(post.selftext)
-            posts['created'].append(get_date(post.created))
-            posts['query'].append(q)
-            posts['url'].append(post.url)
-df = pd.DataFrame(posts)
-
-# cleanup data
-# (1) remove duplicates by id
-df = df.drop_duplicates(subset='id', keep='last').reset_index(drop=True)
-# (2) remove '[removed]' or '[deleted]' posts
-indexNames = df[(df.body == '[removed]') | (df.body == '[deleted]')].index
-df.drop(indexNames, inplace=True)
-
-# export new data
-print('Search returned ' +str(len(df.index))+ ' results.')
-if (os.path.exists('./data.csv')):
-    os.rename('./data.csv', './old_data.csv')
-df.to_csv('data.csv', index=False)
-
-# check the differences between the old data and the new data
-old_df = pd.read_csv('old_data.csv')
-
-old_ids = old_df['id'].to_list()
-new_ids = df['id'].to_list()
-
-new_post_ids = get_new_post_ids(old_ids, new_ids)
-new_posts_df = df[df['id'].isin(new_post_ids)]
-new_posts_df.to_csv('new_posts.csv', index=False)
-
-print('There are ' +str(len(new_post_ids))+ ' new posts. Check new_posts.csv for more info.')
-
-
-
-
+def parse_input(data):
+    """
+    Parse and validate input JSON.
+    """
+    if (validation_checks(data) is False):
+        sys.exit('FAIL: input json is invalid.')
         
+    d = {}
+    for obj in data['data']:
+        d[obj['subreddit']] = obj['queries']
+    
+    return d
+           
+def upload_csv_s3(df, s3_bucket_name, csv_filename):
+    """
+    Converts pandas dataframe to .csv and uploads it to s3.
+    """
+    
+    file_buffer = StringIO()
+    df.to_csv(file_buffer, index=False)
+    
+    # create connection
+    client = boto3.client('s3')
+    
+    # upload to s3, file_buffer.getvalue() is the csv body for the file
+    client.put_object(Bucket=s3_bucket_name, Body=file_buffer.getvalue(), Key=csv_filename)
+    print('LOG: done uploading to S3.')
+    
+    
+def lambda_handler(event, context):
+    # setup     
+    input_data = parse_input(event)
+    subreddit_names = list(input_data.keys())
+
+    reddit = praw.Reddit(client_id=PRAW_CLIENT_ID, client_secret=PRAW_CLIENT_SECRET, user_agent=PRAW_USER_AGENT)
+    posts = {'id':[], 'title':[], 'body':[], 'created':[], 'query': [], 'url':[]}
+
+    # collect data
+    for sr in subreddit_names:
+        subreddit = reddit.subreddit(sr)
+        for q in input_data[sr]:
+            for post in subreddit.search(query=q, sort='new', time_filter='month', limit=20):
+                posts['id'].append(post.id)
+                posts['title'].append(post.title)
+                posts['body'].append(post.selftext)
+                posts['created'].append(get_date(post.created))
+                posts['query'].append(q)
+                posts['url'].append(post.url)
+    df = pd.DataFrame(posts)
+    print('LOG: collected reddit data')
+
+    # (1) remove duplicates by id
+    df = df.drop_duplicates(subset='id', keep='last').reset_index(drop=True)
+    # (2) remove '[removed]' or '[deleted]' posts
+    indexNames = df[(df.body == '[removed]') | (df.body == '[deleted]')].index
+    df.drop(indexNames, inplace=True)
+    print('LOG: cleaned up data')
+    
+    dt_string = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
+    csv_filename = 'reddit-data-' + dt_string + '.csv'
+    upload_csv_s3(df, AWS_S3_BUCKET, csv_filename)
+    return 'SUCCESS: uploaded scraped data to s3.'
